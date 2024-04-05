@@ -1,12 +1,18 @@
 mod cli;
+mod telemetry;
+
 use std::{
     collections::HashMap,
+    io,
     net::{SocketAddrV4, TcpListener, TcpStream},
 };
 
+use anyhow::Context;
 use clap::Parser;
 use cli::Cli;
 use serde::{Deserialize, Serialize};
+use telemetry::init_tracing;
+use tracing::{info, instrument};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Message {
@@ -52,6 +58,7 @@ impl Node {
         }
     }
 
+    #[instrument(skip(self), ret)]
     fn step(&mut self, msg: Message) -> Vec<Message> {
         let messages = match msg.payload {
             Payload::Register { addr } => {
@@ -64,7 +71,6 @@ impl Node {
                     payload: Payload::RegisterOk { known: neighbours },
                 }];
                 self.cnt += 1;
-                dbg!(&self);
                 msg
             }
             Payload::RegisterOk { known } => {
@@ -84,12 +90,10 @@ impl Node {
                     });
                     self.cnt += 1;
                 }
-
-                dbg!(&self);
                 messages
             }
             Payload::GossipRandom { message } => {
-                println!("Message from {}: {}", msg.src, message);
+                info!("Message from {}: {}", msg.src, message);
                 let msgs = vec![Message {
                     src: self.src,
                     dst: msg.dst,
@@ -106,24 +110,35 @@ impl Node {
         messages
     }
 }
-fn main() {
+fn main() -> anyhow::Result<()> {
+    init_tracing();
     let args = Cli::parse();
     let addr = SocketAddrV4::new("127.0.0.1".parse().unwrap(), args.port);
-    let listener = TcpListener::bind(addr).unwrap();
+    let listener = TcpListener::bind(addr).context("Address already in use")?;
     let mut node = Node::new(addr);
     if let Some(dst) = args.connect {
         let msg = node.register(dst);
-        let stream = TcpStream::connect(msg.dst).unwrap();
-        serde_json::to_writer(&stream, &msg).unwrap();
+        let stream =
+            TcpStream::connect(msg.dst).context("Uanble to connect to node to register")?;
+        serde_json::to_writer(&stream, &msg).context("Unable to send a message to a node")?;
     }
     for stream in listener.incoming() {
-        let stream = stream.unwrap();
-        let msg: Message = serde_json::from_reader(stream).unwrap();
-        println!("Message: {:#?}", &msg);
-        let responses = node.step(msg);
-        for msg in responses {
-            let stream = TcpStream::connect(msg.dst).unwrap();
-            serde_json::to_writer(&stream, &msg).unwrap();
+        if let Err(err) = handle_stream(stream, &mut node) {
+            tracing::error!("Failed to handle the incoming message: {}", err);
         }
     }
+    Ok(())
+}
+
+fn handle_stream(stream: io::Result<TcpStream>, node: &mut Node) -> anyhow::Result<()> {
+    let stream = stream.context("TCP stream error")?;
+    let msg: Message =
+        serde_json::from_reader(stream).context("Unable to deserialize the message")?;
+    let responses = node.step(msg);
+    for msg in responses {
+        let stream = TcpStream::connect(msg.dst)
+            .with_context(|| format!("Unable to connect to host {}", msg.dst))?;
+        serde_json::to_writer(&stream, &msg).context("Failed to serialize the message")?;
+    }
+    Ok(())
 }
