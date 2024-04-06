@@ -3,16 +3,17 @@ mod node;
 mod telemetry;
 
 use std::net::SocketAddrV4;
+use std::time::Duration;
 
-use anyhow::Context;
 use clap::Parser;
 use cli::Cli;
-use node::{Message, Node};
+use node::{Event, Message, Node, Trigger};
 
 use telemetry::init_tracing;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
+use tokio::time::interval;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::StreamExt;
@@ -20,7 +21,7 @@ use tracing::{debug, info, warn};
 
 struct TcpSender {
     rx: Receiver<Message>,
-    tx: Sender<Message>,
+    tx: Sender<Event>,
 }
 
 impl TcpSender {
@@ -34,31 +35,27 @@ impl TcpSender {
                 }
                 Err(err) => {
                     warn!("Unable to connect to {}: {}", msg.dst, err);
-                    let res = self.tx
-                        .send(Message {
-                            src: msg.src,
-                            dst: msg.src,
-                            id: msg.id,
-                            payload: node::Payload::Strike { addr: msg.dst },
-                        })
-                        .await;
-                    if res.is_err() {
-                        // channel is closed
-                        break;
-                    }
+                    if self
+                        .tx
+                        .send(Event::Trigger(Trigger::Strike(msg.dst)))
+                        .await
+                        .is_err()
+                    {
+                        info!("Channel closed, sender exiting");
+                        return;
+                    };
                 }
             }
         }
-        info!("Channel closed, sender exiting");
     }
 }
 struct TcpReceiver {
     listener: TcpListenerStream,
-    tx: Sender<Message>,
+    tx: Sender<Event>,
 }
 
 impl TcpReceiver {
-    async fn new(src: SocketAddrV4, tx: Sender<Message>) -> std::io::Result<Self> {
+    async fn new(src: SocketAddrV4, tx: Sender<Event>) -> std::io::Result<Self> {
         let listener = TcpListener::bind(src).await?;
 
         Ok(TcpReceiver {
@@ -72,12 +69,24 @@ impl TcpReceiver {
             let mut buf = Vec::new();
             stream.read_to_end(&mut buf).await.unwrap();
             self.tx
-                .send(serde_json::from_slice(&buf).unwrap())
+                .send(Event::Message(serde_json::from_slice(&buf).unwrap()))
                 .await
                 .unwrap();
         }
     }
 }
+
+async fn ticker(tx: Sender<Event>, period: u64, trigger: Trigger) {
+    let mut ticker = interval(Duration::from_secs(period));
+    loop {
+        ticker.tick().await;
+        if tx.send(Event::Trigger(trigger.clone())).await.is_err() {
+            info!("Channel closed, ticker exiting");
+            return;
+        };
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -85,22 +94,28 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddrV4::new("127.0.0.1".parse().unwrap(), args.port);
     let (sender_tx, sender_rx) = channel(1000);
     let (node_tx, node_rx) = channel(1000);
+    if let Some(registrar) = args.connect {
+        node_tx
+            .send(Event::Trigger(Trigger::Register(registrar)))
+            .await
+            .expect("Sending cannot fail");
+    }
 
     let mut receiver = TcpReceiver::new(addr, node_tx.clone()).await?;
-    let _receiver_handle = tokio::spawn(async move { receiver.run().await });
-    let _sender_handle = tokio::spawn(async {
-        let mut sender = TcpSender {
-            rx: sender_rx,
-            tx: node_tx,
-        };
-        sender.run().await;
-    });
+    let mut sender = TcpSender {
+        rx: sender_rx,
+        tx: node_tx.clone(),
+    };
+    tokio::spawn(ticker(
+        node_tx.clone(),
+        args.period as u64,
+        Trigger::GossipRandom,
+    ));
+    tokio::spawn(ticker(node_tx.clone(), 1, Trigger::GossipSuspects));
+    tokio::spawn(async move { receiver.run().await });
+    tokio::spawn(async move { sender.run().await });
+
     let mut node = Node::new(addr, node_rx, sender_tx);
-    if let Some(registrar) = args.connect {
-        node.register(registrar)
-            .await
-            .context("Unable to register")?;
-    }
-    node.main_loop(args.period).await;
+    node.main_loop().await;
     Ok(())
 }
