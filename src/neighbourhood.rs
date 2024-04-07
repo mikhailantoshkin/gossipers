@@ -40,15 +40,15 @@ impl Suspicion {
 }
 
 #[derive(Debug)]
-struct Neighbor {
+struct Neighbour {
     suspicion: Suspicion,
     suspected_by: HashSet<SocketAddrV4>,
     online: bool,
 }
 
-impl Default for Neighbor {
+impl Default for Neighbour {
     fn default() -> Self {
-        Neighbor {
+        Neighbour {
             suspicion: Suspicion::default(),
             suspected_by: HashSet::new(),
             online: true,
@@ -57,50 +57,50 @@ impl Default for Neighbor {
 }
 
 #[derive(Debug)]
-pub struct Neighborhood(HashMap<SocketAddrV4, Neighbor>);
+pub struct Neighbourhood(HashMap<SocketAddrV4, Neighbour>);
 
-impl Default for Neighborhood {
+impl Default for Neighbourhood {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Neighborhood {
+impl Neighbourhood {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
 
-    /// Add a new neighbor evicting existing neighbor with the same address
-    pub fn register(&mut self, neighbor: SocketAddrV4) {
-        self.0.insert(neighbor, Neighbor::default());
+    /// Add a new neighbour evicting existing neighbour with the same address
+    pub fn register(&mut self, neighbour: SocketAddrV4) {
+        self.0.insert(neighbour, Neighbour::default());
     }
 
-    /// Accuse a neighbor of `Charge`. If neighbor is accused of enough charges, they
+    /// Accuse a neighbour of `Charge`. If neighbour is accused of enough charges, they
     /// are considered suspicious.
-    pub fn accuse(&mut self, neighbor: SocketAddrV4, charge: Charge) {
+    pub fn accuse(&mut self, neighbour: SocketAddrV4, charge: Charge) {
         self.0
-            .entry(neighbor)
+            .entry(neighbour)
             .and_modify(|n| n.suspicion.accuse(charge));
     }
 
-    /// Releases all `Charge`s made against said neighbor.
-    pub fn dismiss(&mut self, neighbor: SocketAddrV4, charge: Charge) {
+    /// Releases all `Charge`s made against said neighbour.
+    pub fn dismiss(&mut self, neighbour: SocketAddrV4, charge: Charge) {
         self.0
-            .entry(neighbor)
+            .entry(neighbour)
             .and_modify(|n| n.suspicion.object(charge));
     }
 
-    /// Report several neighbors of being suspicious. If a neighbor is accused by more then half of the
-    /// other neighbors it is excluded form gossiping
+    /// Report several neighbours of being suspicious. If a neighbour is accused by more then half of the
+    /// other neighbours it is excluded form gossiping
     pub fn report(&mut self, suspects: HashSet<SocketAddrV4>, accuser: SocketAddrV4) {
-        let neighborhood_size = self.0.len();
+        let neighbourhood_size = self.0.len();
         for (a, n) in self.0.iter_mut() {
             if suspects.contains(a) {
                 n.suspected_by.insert(accuser);
             } else {
                 n.suspected_by.remove(&accuser);
             }
-            if neighborhood_size >= 3 && n.suspected_by.len() > neighborhood_size / 2 {
+            if neighbourhood_size >= 3 && n.suspected_by.len() > neighbourhood_size / 2 {
                 n.suspicion.jury_ruling();
                 n.online = false;
             } else {
@@ -109,7 +109,7 @@ impl Neighborhood {
         }
     }
 
-    /// Get all neighbors considered suspicious by current node. The neighbor is suspicious when they accused of enough
+    /// Get all neighbours considered suspicious by current node. The neighbour is suspicious when they accused of enough
     /// `Charge`s of the same type. Being suspicious does not exclude them from gossiping
     pub fn get_suspects(&self) -> HashSet<SocketAddrV4> {
         self.0
@@ -118,7 +118,7 @@ impl Neighborhood {
             .collect()
     }
 
-    /// Select neighbors to gossip with. Exclude neighbors that are considered suspicious by majority of the neighborhood
+    /// Select neighbours to gossip with. Exclude neighbours that are considered suspicious by majority of the neighbourhood
     pub fn select_gossipers(&self) -> Vec<SocketAddrV4> {
         self.0
             .iter()
@@ -126,11 +126,11 @@ impl Neighborhood {
             .collect()
     }
 
-    pub fn get_all_neighbors(&self) -> Vec<SocketAddrV4> {
+    pub fn get_all_neighbours(&self) -> Vec<SocketAddrV4> {
         self.0.keys().cloned().collect()
     }
 
-    pub fn is_registered(&self, neighbor: &SocketAddrV4) -> bool {
-        self.0.contains_key(neighbor)
+    pub fn is_registered(&self, neighbour: &SocketAddrV4) -> bool {
+        self.0.contains_key(neighbour)
     }
 }

@@ -115,6 +115,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { sender.run().await });
 
     let mut node = Node::new(addr, node_rx, sender_tx);
+    info!(
+        "Welcome to the gossip-rs network! This node is listening on {} and sending gossip messages every {} second(s)",
+        addr, args.period
+    );
     node.main_loop().await;
     Ok(())
 }
