@@ -1,15 +1,11 @@
-mod cli;
-mod node;
-mod telemetry;
-
 use std::net::SocketAddrV4;
 use std::time::Duration;
 
 use clap::Parser;
-use cli::Cli;
-use node::{Event, Message, Node, Trigger};
+use gossipers::cli::Cli;
+use gossipers::node::{Event, Message, Node, Trigger};
 
-use telemetry::init_tracing;
+use gossipers::telemetry::init_tracing;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -112,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         Trigger::GossipRandom,
     ));
     tokio::spawn(ticker(node_tx.clone(), 1, Trigger::GossipSuspects));
+    tokio::spawn(ticker(node_tx.clone(), 10, Trigger::CheckReplies));
     tokio::spawn(async move { receiver.run().await });
     tokio::spawn(async move { sender.run().await });
 

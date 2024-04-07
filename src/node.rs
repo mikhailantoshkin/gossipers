@@ -3,8 +3,14 @@ use std::vec;
 use std::{collections::HashMap, net::SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, instrument, warn, Level};
+
+use crate::neighborhood::Charge;
+use crate::neighborhood::Neighborhood;
+
+const STALE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Message {
@@ -27,6 +33,7 @@ pub enum Trigger {
     GossipRandom,
     GossipSuspects,
     Strike(SocketAddrV4),
+    CheckReplies,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -39,19 +46,15 @@ pub enum Payload {
     GossipSuspectOk,
 }
 
-#[derive(Debug)]
-struct Neighbour {
-    strikes: u8,
-    suspected_by: HashSet<SocketAddrV4>,
-    online: bool,
-}
-
-impl Default for Neighbour {
-    fn default() -> Self {
-        Neighbour {
-            strikes: 0,
-            suspected_by: HashSet::new(),
-            online: true,
+impl Payload {
+    fn requires_reply(&self) -> bool {
+        match self {
+            Payload::Register
+            | Payload::GossipRandom { message: _ }
+            | Payload::GossipSuspect { suspects: _ } => true,
+            Payload::RegisterOk { known: _ }
+            | Payload::GossipRandomOk
+            | Payload::GossipSuspectOk => false,
         }
     }
 }
@@ -60,9 +63,10 @@ impl Default for Neighbour {
 pub struct Node {
     src: SocketAddrV4,
     cnt: u32,
-    neighbours: HashMap<SocketAddrV4, Neighbour>,
+    neighborhood: Neighborhood,
     rx: Receiver<Event>,
     tx: Sender<Message>,
+    awaiting_reply: HashMap<u32, (SocketAddrV4, Instant)>,
 }
 
 impl Node {
@@ -70,9 +74,10 @@ impl Node {
         Node {
             src: addr,
             cnt: 0,
-            neighbours: HashMap::new(),
+            neighborhood: Neighborhood::new(),
             rx,
             tx,
+            awaiting_reply: HashMap::new(),
         }
     }
 
@@ -90,111 +95,137 @@ impl Node {
     #[instrument(level = Level::DEBUG, skip(self), ret(level = Level::DEBUG))]
     fn step(&mut self, event: Event) -> Vec<Message> {
         match event {
-            Event::Trigger(trigger) => match trigger {
-                Trigger::Register(dst) => {
-                    self.neighbours.entry(dst).or_default();
-                    vec![self.message(dst, None, Payload::Register)]
-                }
-                Trigger::GossipRandom => self.gossip(),
-                Trigger::GossipSuspects => self.gossip_suspects(),
-                Trigger::Strike(addr) => {
-                    warn!("Received a strike for {}", addr);
-                    self.neighbours.entry(addr).and_modify(|n| {
-                        if n.strikes < 3 {
-                            n.strikes += 1;
-                        };
-                    });
-                    vec![]
-                }
-            },
-            Event::Message(msg) => {
-                self.neighbours.entry(msg.src).and_modify(|n| n.strikes = 0);
-                match msg.payload {
-                    Payload::Register => {
-                        let neighbours: Vec<SocketAddrV4> =
-                            self.neighbours.keys().cloned().collect();
-                        self.neighbours.entry(msg.src).or_default();
-                        vec![self.message(
-                            msg.src,
-                            Some(msg.id),
-                            Payload::RegisterOk { known: neighbours },
-                        )]
-                    }
-                    Payload::RegisterOk { known } => {
-                        let to_register: Vec<SocketAddrV4> = known
-                            .into_iter()
-                            .filter(|n| !self.neighbours.contains_key(n))
-                            .collect();
-                        let mut messages: Vec<Message> = Vec::with_capacity(to_register.len());
-                        for addr in to_register {
-                            self.neighbours.insert(addr, Neighbour::default());
-                            messages.push(self.message(
-                                addr,
-                                None,
-                                Payload::Register,
-                            ));
-                        }
-                        debug!("My neighbourhood is {:#?}", self.neighbours.keys());
-                        messages
-                    }
-                    Payload::GossipRandom { message } => {
-                        info!("Message from {}: {}", msg.src, message);
-                        vec![self.message(msg.dst, Some(msg.id), Payload::GossipRandomOk)]
-                    }
-                    Payload::GossipSuspect { suspects } => {
-                        info!(
-                            "Recieved list of suspects from {}: {:#?}",
-                            msg.src, suspects
-                        );
+            Event::Trigger(trigger) => self.handle_trigger(trigger),
+            Event::Message(msg) => self.handle_message(msg),
+        }
+    }
 
-                        let neighbourhood_size = self.neighbours.len();
-
-                        for (a, n) in self.neighbours.iter_mut() {
-                            if suspects.contains(a) {
-                                n.suspected_by.insert(msg.src);
-                            } else {
-                                n.suspected_by.remove(&msg.src);
-                            }
-                            if neighbourhood_size >= 3
-                                && n.suspected_by.len() > neighbourhood_size / 2
-                            {
-                                n.strikes = 3;
-                                n.online = false;
-                            }
-                        }
-
-                        vec![self.message(msg.src, Some(msg.id), Payload::GossipSuspectOk)]
-                    }
-                    Payload::GossipRandomOk | Payload::GossipSuspectOk => {
-                        vec![]
-                    }
+    fn handle_trigger(&mut self, trigger: Trigger) -> Vec<Message> {
+        match trigger {
+            Trigger::Register(dst) => {
+                self.neighborhood.register(dst);
+                vec![self.message(dst, None, Payload::Register)]
+            }
+            Trigger::GossipRandom => self.gossip(),
+            Trigger::GossipSuspects => self.gossip_suspects(),
+            Trigger::Strike(addr) => {
+                warn!("Received a strike for {}", addr);
+                self.neighborhood.accuse(addr, Charge::Connection);
+                vec![]
+            }
+            Trigger::CheckReplies => {
+                let stale_keys: Vec<_> = self
+                    .awaiting_reply
+                    .iter()
+                    .filter_map(|(k, (_, instant))| {
+                        instant.elapsed().gt(&STALE_TIMEOUT).then_some(k)
+                    })
+                    .cloned()
+                    .collect();
+                for stale in stale_keys {
+                    let (dst, instant) = self.awaiting_reply.remove(&stale).unwrap();
+                    warn!(
+                        "Didn't receive reply in time from {} for message {}. Elapsed: {}",
+                        dst,
+                        stale,
+                        instant.elapsed().as_secs()
+                    );
+                    self.neighborhood.accuse(dst, Charge::Reply);
                 }
+                vec![]
             }
         }
     }
 
-    fn select_gossipers(&self) -> Vec<SocketAddrV4> {
-        dbg!(&self.neighbours);
-        self.neighbours
-            .iter()
-            .filter_map(|(a, n)| n.online.then_some(*a))
-            .collect()
+    fn handle_message(&mut self, msg: Message) -> Vec<Message> {
+        self.neighborhood.dismiss(msg.src, Charge::Connection);
+        match msg.payload {
+            Payload::Register => {
+                let neighbors: Vec<SocketAddrV4> = self.neighborhood.get_all_neighbors();
+                self.neighborhood.register(msg.src);
+                vec![self.message(
+                    msg.src,
+                    Some(msg.id),
+                    Payload::RegisterOk { known: neighbors },
+                )]
+            }
+            Payload::RegisterOk { known } => {
+                self.handle_reply(msg.reply_to, msg.src);
+                let to_register: Vec<SocketAddrV4> = known
+                    .into_iter()
+                    .filter(|n| !self.neighborhood.is_registered(n))
+                    .collect();
+                let mut messages: Vec<Message> = Vec::with_capacity(to_register.len());
+                for addr in to_register {
+                    self.neighborhood.register(addr);
+                    messages.push(self.message(addr, None, Payload::Register));
+                }
+                debug!("My neighborhood is {:#?}", self.neighborhood);
+                messages
+            }
+            Payload::GossipRandom { message } => {
+                info!("Message from {}: {}", msg.src, message);
+                vec![self.message(msg.src, Some(msg.id), Payload::GossipRandomOk)]
+            }
+            Payload::GossipSuspect { suspects } => {
+                info!(
+                    "Received list of suspects from {}: {:#?}",
+                    msg.src, suspects
+                );
+                self.neighborhood.report(suspects, msg.src);
+                vec![self.message(msg.src, Some(msg.id), Payload::GossipSuspectOk)]
+            }
+            Payload::GossipRandomOk | Payload::GossipSuspectOk => {
+                self.handle_reply(msg.reply_to, msg.src);
+                vec![]
+            }
+        }
+    }
+
+    fn handle_reply(&mut self, reply_id: Option<u32>, src: SocketAddrV4) {
+        match reply_id {
+            Some(reply_id) => match self.awaiting_reply.remove(&reply_id) {
+                Some((dst, sended_at)) => {
+                    if dst != src {
+                        warn!(
+                            "Expected response for message_id {} from {}, but got response from {}",
+                            reply_id, dst, src
+                        );
+                    } else {
+                        self.neighborhood.dismiss(src, Charge::Reply);
+                        debug!(
+                            "Got response for message_id {} from {}. Reply took {}",
+                            reply_id,
+                            src,
+                            sended_at.elapsed().as_nanos()
+                        );
+                    }
+                }
+                None => {
+                    warn!(
+                        "Received reply for message_id {} from {}, but no reply is expected",
+                        reply_id, src
+                    );
+                }
+            },
+            None => {
+                warn!(
+                    "Reply message from {} doesn't have the 'reply_to' field set",
+                    src
+                );
+            }
+        }
     }
 
     fn gossip_suspects(&mut self) -> Vec<Message> {
-        let suspects: HashSet<_> = self
-            .neighbours
-            .iter()
-            .filter(|(_, n)| n.strikes >= 3)
-            .map(|(k, _)| *k)
-            .collect();
+        let suspects: HashSet<_> = self.neighborhood.get_suspects();
         if suspects.is_empty() {
-            info!("Not suspectins anyone of treason");
+            info!("Not suspecting anyone of treason");
             return vec![];
         }
-        let gossipers: Vec<_> = self.select_gossipers();
+        let gossipers: Vec<_> = self.neighborhood.select_gossipers();
         info!(
-            "Time to gossip suspects! Gossiping with {} neghbours",
+            "Time to gossip suspects! Gossiping with {} neighbors",
             gossipers.len()
         );
         let mut messages = Vec::with_capacity(gossipers.len());
@@ -211,9 +242,10 @@ impl Node {
     }
 
     fn gossip(&mut self) -> Vec<Message> {
-        let gossipers: Vec<_> = self.select_gossipers();
+        dbg!(&self.neighborhood);
+        let gossipers: Vec<_> = self.neighborhood.select_gossipers();
         info!(
-            "Time to gossip! Gossiping with {} neghbours",
+            "Time to gossip! Gossiping with {} neighbors",
             gossipers.len()
         );
         let mut messages = Vec::with_capacity(gossipers.len());
@@ -231,6 +263,9 @@ impl Node {
 
     fn message(&mut self, dst: SocketAddrV4, reply_to: Option<u32>, payload: Payload) -> Message {
         self.cnt += 1;
+        if payload.requires_reply() {
+            self.awaiting_reply.insert(self.cnt, (dst, Instant::now()));
+        }
         Message {
             src: self.src,
             dst,
