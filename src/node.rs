@@ -31,7 +31,7 @@ pub enum Trigger {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Payload {
-    Register { addr: SocketAddrV4 },
+    Register,
     RegisterOk { known: Vec<SocketAddrV4> },
     GossipRandom { message: String },
     GossipRandomOk,
@@ -92,7 +92,8 @@ impl Node {
         match event {
             Event::Trigger(trigger) => match trigger {
                 Trigger::Register(dst) => {
-                    vec![self.message(dst, None, Payload::Register { addr: self.src })]
+                    self.neighbours.entry(dst).or_default();
+                    vec![self.message(dst, None, Payload::Register)]
                 }
                 Trigger::GossipRandom => self.gossip(),
                 Trigger::GossipSuspects => self.gossip_suspects(),
@@ -109,10 +110,10 @@ impl Node {
             Event::Message(msg) => {
                 self.neighbours.entry(msg.src).and_modify(|n| n.strikes = 0);
                 match msg.payload {
-                    Payload::Register { addr } => {
+                    Payload::Register => {
                         let neighbours: Vec<SocketAddrV4> =
                             self.neighbours.keys().cloned().collect();
-                        self.neighbours.entry(addr).or_default();
+                        self.neighbours.entry(msg.src).or_default();
                         vec![self.message(
                             msg.src,
                             Some(msg.id),
@@ -120,7 +121,6 @@ impl Node {
                         )]
                     }
                     Payload::RegisterOk { known } => {
-                        self.neighbours.entry(msg.src).or_default();
                         let to_register: Vec<SocketAddrV4> = known
                             .into_iter()
                             .filter(|n| !self.neighbours.contains_key(n))
@@ -131,7 +131,7 @@ impl Node {
                             messages.push(self.message(
                                 addr,
                                 None,
-                                Payload::Register { addr: self.src },
+                                Payload::Register,
                             ));
                         }
                         debug!("My neighbourhood is {:#?}", self.neighbours.keys());
@@ -158,6 +158,7 @@ impl Node {
                             if neighbourhood_size >= 3
                                 && n.suspected_by.len() > neighbourhood_size / 2
                             {
+                                n.strikes = 3;
                                 n.online = false;
                             }
                         }
@@ -173,6 +174,7 @@ impl Node {
     }
 
     fn select_gossipers(&self) -> Vec<SocketAddrV4> {
+        dbg!(&self.neighbours);
         self.neighbours
             .iter()
             .filter_map(|(a, n)| n.online.then_some(*a))
