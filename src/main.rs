@@ -74,6 +74,8 @@ impl TcpReceiver {
 
 async fn ticker(tx: Sender<Event>, period: u64, trigger: Trigger) {
     let mut ticker = interval(Duration::from_secs(period));
+    // first tick is always instantaneous
+    ticker.tick().await;
     loop {
         ticker.tick().await;
         if tx.send(Event::Trigger(trigger.clone())).await.is_err() {

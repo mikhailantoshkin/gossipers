@@ -168,7 +168,7 @@ impl Node {
                 vec![self.message(msg.src, Some(msg.id), Payload::GossipRandomOk)]
             }
             Payload::GossipSuspect { suspects } => {
-                info!(
+                debug!(
                     "Received list of suspects from {}: {:#?}",
                     msg.src, suspects
                 );
@@ -220,11 +220,11 @@ impl Node {
     fn gossip_suspects(&mut self) -> Vec<Message> {
         let suspects: HashSet<_> = self.neighborhood.get_suspects();
         if suspects.is_empty() {
-            info!("Not suspecting anyone of treason");
+            debug!("Not suspecting anyone of treason");
             return vec![];
         }
         let gossipers: Vec<_> = self.neighborhood.select_gossipers();
-        info!(
+        debug!(
             "Time to gossip suspects! Gossiping with {} neighbors",
             gossipers.len()
         );
@@ -242,7 +242,6 @@ impl Node {
     }
 
     fn gossip(&mut self) -> Vec<Message> {
-        dbg!(&self.neighborhood);
         let gossipers: Vec<_> = self.neighborhood.select_gossipers();
         info!(
             "Time to gossip! Gossiping with {} neighbors",
